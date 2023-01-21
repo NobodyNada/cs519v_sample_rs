@@ -1,0 +1,20 @@
+[package]
+name = "sample_rs"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = { version = "1.0.68", features = ["backtrace"] }
+bytemuck = { version = "1.13.0", features = ["derive"] }
+image = "0.24.5"
+nalgebra = "0.31.0"
+vulkano = { version = "0.32.3", features = ["nalgebra"] }
+vulkano-shaders = "0.32.0"
+vulkano-util = "0.32.0"
+vulkano-win = "0.32.0"
+winit = "0.27.5"
+
+[profile.dev]
+opt-level = 1
