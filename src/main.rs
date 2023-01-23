@@ -6,7 +6,8 @@ use vulkano::instance;
 use vulkano_util::context::{VulkanoConfig, VulkanoContext};
 use vulkano_win::VkSurfaceBuild;
 use winit::{
-    event::{Event, WindowEvent},
+    dpi::PhysicalPosition,
+    event::{DeviceEvent, ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
     window::WindowBuilder,
 };
@@ -56,6 +57,7 @@ fn main() -> Result<()> {
     let mut renderer = render::Renderer::new(context, surface)?;
 
     // Start our event loop.
+    let mut mouse_clicked = false;
     event_loop.run(move |event, _, control_flow| {
         match event {
             Event::WindowEvent { event, .. } => match event {
@@ -75,7 +77,37 @@ fn main() -> Result<()> {
                     c => println!("Received key press: {c}"),
                 },
 
+                // Handle mouse clicks.
+                WindowEvent::MouseInput {
+                    button: MouseButton::Left,
+                    state,
+                    ..
+                } => {
+                    mouse_clicked = state == ElementState::Pressed;
+                }
+
                 // Ignore other types of window events.
+                _ => {}
+            },
+
+            Event::DeviceEvent { event, .. } => match event {
+                // If the user moves the mouse while clicking, that's a drag.
+                DeviceEvent::MouseMotion { delta: (dx, dy) } if mouse_clicked => {
+                    renderer.mouse_dragged(dx as f32, dy as f32)
+                }
+
+                // Handle scroll events.
+                DeviceEvent::MouseWheel { delta } => {
+                    let (dx, dy) = match delta {
+                        MouseScrollDelta::LineDelta(dx, dy) => (dx, dy),
+                        MouseScrollDelta::PixelDelta(PhysicalPosition { x: dx, y: dy }) => {
+                            (dx as f32, dy as f32)
+                        }
+                    };
+                    renderer.mouse_scrolled(dx, dy);
+                }
+
+                // Ignore other types of device events.
                 _ => {}
             },
 

@@ -3,6 +3,7 @@ use std::{cell::RefCell, sync::Arc};
 use crate::shaders;
 
 use anyhow::{anyhow, bail, Context, Result};
+use na::{point, vector};
 use nalgebra as na;
 use vk::{command_buffer::PrimaryCommandBufferAbstract, pipeline::Pipeline, sync::GpuFuture};
 use vulkano as vk;
@@ -58,6 +59,11 @@ pub struct Renderer {
     /// The scene-orientation matrix.
     scene_orient: na::Matrix4<f32>,
 
+    /// The rotation the user input via the mouse.
+    mouse_rotation: na::Vector2<f32>,
+    // The scale the user input via the mouse.
+    mouse_scale: f32,
+
     /// The variables controlling animation playback.
     animation_state: AnimationState,
     /// Whether the user has enabled automatic rotation.
@@ -97,16 +103,33 @@ impl Renderer {
         let time = duration.as_secs_f32();
 
         const SECONDS_PER_CYCLE: f32 = 3.;
-        // Gradually rotate the scene around.
-        self.scene_orient = if self.use_rotation {
-            na::Rotation::from_axis_angle(
+
+        // Scale the scene by our scale factor.
+        self.scene_orient =
+            na::Scale3::new(self.mouse_scale, self.mouse_scale, self.mouse_scale).into();
+
+        // Rotate the scene around by either the mouse rotation or the animated rotation.
+        if self.use_rotation {
+            let gradual_rotation: na::Matrix4<f32> = na::Rotation::from_axis_angle(
                 &na::UnitVector3::new_unchecked(na::Vector3::y()),
                 2. * std::f32::consts::PI * time / SECONDS_PER_CYCLE,
             )
-            .into()
+            .into();
+            self.scene_orient *= gradual_rotation;
         } else {
-            na::Matrix4::identity()
-        };
+            let mouse_rotation_x: na::Matrix4<f32> = na::Rotation::from_axis_angle(
+                &na::UnitVector3::new_unchecked(na::Vector3::x()),
+                self.mouse_rotation.x,
+            )
+            .into();
+            let mouse_rotation_y: na::Matrix4<f32> = na::Rotation::from_axis_angle(
+                &na::UnitVector3::new_unchecked(na::Vector3::y()),
+                self.mouse_rotation.y,
+            )
+            .into();
+
+            self.scene_orient *= mouse_rotation_x * mouse_rotation_y;
+        }
 
         // Return the animation time, since that goes in the scene uniform buffer.
         time
@@ -183,7 +206,7 @@ impl Renderer {
             uProjection: (*projection).into(),
             uView: self.view.into(),
             uSceneOrient: self.scene_orient.into(),
-            uLightPos: na::Point4::new(-50., -50., 10., 1.).into(),
+            uLightPos: na::Point4::new(-50., 50., 10., 1.).into(),
             uLightColor: na::Vector4::new(1., 1., 1., 1.).into(),
             uLightKaKdKs: na::Vector4::new(0.2, 0.5, 0.3, 1.).into(),
             uTime: time,
@@ -284,6 +307,19 @@ impl Renderer {
         self.projection = None;
     }
 
+    pub fn mouse_dragged(&mut self, dx: f32, dy: f32) {
+        const ANGFACT: f32 = std::f32::consts::PI / 180.;
+        self.mouse_rotation += vector![-dy, dx] * ANGFACT;
+    }
+
+    pub fn mouse_scrolled(&mut self, dx: f32, dy: f32) {
+        const SCLFACT: f32 = 0.005;
+        const MINSCALE: f32 = 0.05;
+        self.mouse_scale += dy * SCLFACT;
+        self.mouse_scale = self.mouse_scale.max(MINSCALE);
+        println!("scrolled: {dx}, {dy}");
+    }
+
     /// Called when the user toggles lighting off or on.
     pub fn toggle_lighting(&mut self) {
         self.sporadic_uniforms.uUseLighting = (self.sporadic_uniforms.uUseLighting == 0) as i32;
@@ -320,76 +356,76 @@ impl Renderer {
             // front face of pyramid
             Attributes {
                 aVertex: [0., 1., 0.],
-                aNormal: na::Vector3::new(0., 1., 1.).normalize().into(),
+                aNormal: vector![0., 1., 1.].normalize().into(),
                 aColor: [1., 0., 0.],
                 aTexCoord: [0.5, 0.],
             },
             Attributes {
                 aVertex: [1., 0., 1.],
-                aNormal: na::Vector3::new(0., 1., 1.).normalize().into(),
+                aNormal: vector![0., 1., 1.].normalize().into(),
                 aColor: [1., 0., 0.],
                 aTexCoord: [1., 1.],
             },
             Attributes {
                 aVertex: [-1., 0., 1.],
-                aNormal: na::Vector3::new(0., 1., 1.).normalize().into(),
+                aNormal: vector![0., 1., 1.].normalize().into(),
                 aColor: [1., 0., 0.],
                 aTexCoord: [0., 1.],
             },
             // left face
             Attributes {
                 aVertex: [0., 1., 0.],
-                aNormal: na::Vector3::new(-1., 1., 0.).normalize().into(),
+                aNormal: vector![-1., 1., 0.].normalize().into(),
                 aColor: [0., 1., 0.],
                 aTexCoord: [0.5, 0.],
             },
             Attributes {
                 aVertex: [-1., 0., 1.],
-                aNormal: na::Vector3::new(-1., 1., 0.).normalize().into(),
+                aNormal: vector![-1., 1., 0.].normalize().into(),
                 aColor: [0., 1., 0.],
                 aTexCoord: [1., 1.],
             },
             Attributes {
                 aVertex: [-1., 0., -1.],
-                aNormal: na::Vector3::new(-1., 1., 0.).normalize().into(),
+                aNormal: vector![-1., 1., 0.].normalize().into(),
                 aColor: [0., 1., 0.],
                 aTexCoord: [0., 1.],
             },
             // right face
             Attributes {
                 aVertex: [0., 1., 0.],
-                aNormal: na::Vector3::new(1., 1., 0.).normalize().into(),
+                aNormal: vector![1., 1., 0.].normalize().into(),
                 aColor: [0., 0., 1.],
                 aTexCoord: [0.5, 0.],
             },
             Attributes {
                 aVertex: [1., 0., -1.],
-                aNormal: na::Vector3::new(1., 1., 0.).normalize().into(),
+                aNormal: vector![1., 1., 0.].normalize().into(),
                 aColor: [0., 0., 1.],
                 aTexCoord: [0., 1.],
             },
             Attributes {
                 aVertex: [1., 0., 1.],
-                aNormal: na::Vector3::new(1., 1., 0.).normalize().into(),
+                aNormal: vector![1., 1., 0.].normalize().into(),
                 aColor: [0., 0., 1.],
                 aTexCoord: [1., 1.],
             },
             // back face
             Attributes {
                 aVertex: [0., 1., 0.],
-                aNormal: na::Vector3::new(0., 1., -1.).normalize().into(),
+                aNormal: vector![0., 1., -1.].normalize().into(),
                 aColor: [1., 1., 0.],
                 aTexCoord: [0.5, 0.],
             },
             Attributes {
                 aVertex: [1., 0., -1.],
-                aNormal: na::Vector3::new(0., 1., -1.).normalize().into(),
+                aNormal: vector![0., 1., -1.].normalize().into(),
                 aColor: [1., 1., 0.],
                 aTexCoord: [0., 1.],
             },
             Attributes {
                 aVertex: [-1., 0., -1.],
-                aNormal: na::Vector3::new(0., 1., -1.).normalize().into(),
+                aNormal: vector![0., 1., -1.].normalize().into(),
                 aColor: [1., 1., 0.],
                 aTexCoord: [1., 1.],
             },
@@ -413,16 +449,16 @@ impl Renderer {
                 aTexCoord: [0., 0.],
             },
             Attributes {
-                aVertex: [1., 0., -1.],
-                aNormal: [0., -1., 0.],
-                aColor: [0., 1., 1.],
-                aTexCoord: [1., 1.],
-            },
-            Attributes {
                 aVertex: [-1., 0., -1.],
                 aNormal: [0., -1., 0.],
                 aColor: [0., 1., 1.],
                 aTexCoord: [0., 0.],
+            },
+            Attributes {
+                aVertex: [-1., 0., 1.],
+                aNormal: [0., -1., 0.],
+                aColor: [0., 1., 1.],
+                aTexCoord: [1., 0.],
             },
             Attributes {
                 aVertex: [1., 0., 1.],
@@ -733,10 +769,10 @@ impl Renderer {
             scene_uniform_buffer_layout,
             object_uniform_buffer,
             sampler_descriptor_set,
-            projection: None,
 
+            projection: None,
             view: na::Matrix4::look_at_rh(
-                &na::Point3::new(-2., 1., -2.),
+                &point![0., 1., -2.],
                 &na::Point3::origin(),
                 &na::Vector3::y(),
             ),
@@ -745,6 +781,8 @@ impl Renderer {
                 start: std::time::Instant::now(),
             },
             use_rotation: true,
+            mouse_rotation: na::Vector2::zeros(),
+            mouse_scale: 1.,
 
             vertex_buffer,
             num_vertices: num_vertices.try_into().expect("that's a lot of vertices"),
