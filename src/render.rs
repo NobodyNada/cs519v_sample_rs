@@ -317,7 +317,6 @@ impl Renderer {
         const MINSCALE: f32 = 0.05;
         self.mouse_scale += dy * SCLFACT;
         self.mouse_scale = self.mouse_scale.max(MINSCALE);
-        println!("scrolled: {dx}, {dy}");
     }
 
     /// Called when the user toggles lighting off or on.
