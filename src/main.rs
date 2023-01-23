@@ -12,7 +12,7 @@ use winit::{
     window::WindowBuilder,
 };
 
-const WINDOW_TITLE: &str = "CS519V Rust Sample | Jonathan Keller";
+const WINDOW_TITLE: &str = "CS519v Rust Sample | Jonathan Keller";
 
 fn main() -> Result<()> {
     // Create the application event loop
