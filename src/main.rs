@@ -52,7 +52,7 @@ fn main() -> Result<()> {
         .with_title(WINDOW_TITLE)
         .build_vk_surface(&event_loop, context.instance().clone())?;
 
-    // Create and initialize our renderer.
+    // Create and initialize our rendering loop.
     let mut renderer = render::Renderer::new(context, surface)?;
 
     // Start our event loop.
@@ -85,11 +85,13 @@ fn main() -> Result<()> {
                 Err(e) => eprintln!("[ERROR] {e}"),
             },
 
+            // Ignore other types of events.
             _ => {}
         };
     })
 }
 
+/// This callback will be invoked whenever the Vulkan API generates a debug message.
 fn debug(msg: &vulkano::instance::debug::Message<'_>) {
     let severity = if msg.severity.error {
         "ERROR"
@@ -104,9 +106,9 @@ fn debug(msg: &vulkano::instance::debug::Message<'_>) {
     };
 
     let ty = if msg.ty.validation {
-        "[VALIDATION] "
+        " [VALIDATION]"
     } else if msg.ty.performance {
-        "[PERF] "
+        " [PERF]"
     } else {
         ""
     };

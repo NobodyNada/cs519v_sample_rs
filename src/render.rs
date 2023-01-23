@@ -10,50 +10,85 @@ use vulkano_util::context::VulkanoContext;
 
 /// The renderer structure. Put variables needed for rendering here.
 pub struct Renderer {
+    /// The Vulkan context, holding our instance, device, queue, etc.
     context: VulkanoContext,
+
+    /// The surface to render to.
     surface: Arc<vk::swapchain::Surface>,
-
+    /// The format of the color buffer.
     color_format: vk::format::Format,
+    /// The format of the debpth buffer.
     depth_format: vk::format::Format,
-    render_pass: Arc<vk::render_pass::RenderPass>,
-
+    /// The swapchain to use, and the buffers bound to that swapchain.
     framebuffers: RefCell<Framebuffers>,
+
+    /// The configuration of our render pass.
+    render_pass: Arc<vk::render_pass::RenderPass>,
+    /// Our graphics pipeline, specifying the settings and shaders to use
+    /// to transform vertex attributes into pixels on the screen.
     pipeline: Arc<vk::pipeline::GraphicsPipeline>,
     command_buffer_allocator: vk::command_buffer::allocator::StandardCommandBufferAllocator,
 
     descriptor_set_allocator: vk::descriptor_set::allocator::StandardDescriptorSetAllocator,
-    scene_uniform_buffer_layout: Arc<vk::descriptor_set::layout::DescriptorSetLayout>,
-    object_uniform_buffer_layout: Arc<vk::descriptor_set::layout::DescriptorSetLayout>,
+    /// Our occasionally-updated uniforms specifying the scene settings.
+    sporadic_uniforms: shaders::sample::ty::sporadicBuf,
+    /// Whether we need to update our sporadic uniform buffer.
+    sporadic_needs_update: bool,
+    /// The data buffer storing our sporadic uniforms in GPU memory.
+    sporadic_uniform_buffer: Arc<vk::buffer::DeviceLocalBuffer<shaders::sample::ty::sporadicBuf>>,
+    /// The descriptor set binding our sporadic uniforms to the pipeline.
     sporadic_descriptor_set: Arc<vk::descriptor_set::PersistentDescriptorSet>,
 
-    sporadic_uniform_buffer: Arc<vk::buffer::DeviceLocalBuffer<shaders::sample::ty::sporadicBuf>>,
+    /// The uniform buffer for our scene uniforms, stored in device memory and updated each frame.
     scene_uniform_buffer: vk::buffer::CpuBufferPool<shaders::sample::ty::sceneBuf>,
+    /// The uniform buffer for our object uniforms in device memory.
+    object_uniform_buffer_layout: Arc<vk::descriptor_set::layout::DescriptorSetLayout>,
+    /// The layout of the descriptor set for the scene uniform buffer.
+    scene_uniform_buffer_layout: Arc<vk::descriptor_set::layout::DescriptorSetLayout>,
+    /// The layout of the descriptor set for the object uniform buffer.
     object_uniform_buffer: vk::buffer::CpuBufferPool<shaders::sample::ty::objectBuf>,
 
-    sporadic_uniforms: shaders::sample::ty::sporadicBuf,
-    sporadic_needs_update: bool,
-
-    projection: Option<na::Matrix4<f32>>,
-    view: na::Matrix4<f32>,
-    scene_orient: na::Matrix4<f32>,
-
-    animation_state: AnimationState,
-    use_rotation: bool,
-
-    num_vertices: u32,
-    vertex_buffer: Arc<vk::buffer::DeviceLocalBuffer<[shaders::sample::Attributes]>>,
-
+    /// The descriptor set binding our texture image and sampler.
     sampler_descriptor_set: Arc<vk::descriptor_set::PersistentDescriptorSet>,
 
+    /// The projection matrix.
+    projection: Option<na::Matrix4<f32>>,
+    /// The view matrix.
+    view: na::Matrix4<f32>,
+    /// The scene-orientation matrix.
+    scene_orient: na::Matrix4<f32>,
+
+    /// The variables controlling animation playback.
+    animation_state: AnimationState,
+    /// Whether the user has enabled automatic rotation.
+    use_rotation: bool,
+
+    /// Our vertex buffer, stored in device memory.
+    vertex_buffer: Arc<vk::buffer::DeviceLocalBuffer<[shaders::sample::Attributes]>>,
+    /// The number of vertices in the vertex buffer.
+    num_vertices: u32,
+
+    /// The future representing the time at which the previous frame will finish rendering.
+    ///
+    /// Since GPU work happens asyncronously, Vulkano uses "futures" to represent the status of
+    /// this work. Whenever we submit a commmand buffer we're given a "future" representing the
+    /// moment in time that the command buffer finishes executing -- as the name implies, this time
+    /// may be indefinitely in the future. Later on, we can synchronize events (such as the
+    /// rendering of the next frame) to occur after this future completes.
     previous_frame: Option<Box<dyn vk::sync::GpuFuture>>,
 }
 
+/// The status of our animation.
 enum AnimationState {
+    /// The animation is running. `start` is the moment at which t=0.
     Running { start: std::time::Instant },
+
+    /// The animation is paused, at t=`elapsed`.
     Paused { elapsed: std::time::Duration },
 }
 
 impl Renderer {
+    /// Called before rendering each frame to update animated variables.
     pub fn animate(&mut self) -> f32 {
         let duration = match self.animation_state {
             AnimationState::Running { start } => start.elapsed(),
@@ -62,6 +97,7 @@ impl Renderer {
         let time = duration.as_secs_f32();
 
         const SECONDS_PER_CYCLE: f32 = 3.;
+        // Gradually rotate the scene around.
         self.scene_orient = if self.use_rotation {
             na::Rotation::from_axis_angle(
                 &na::UnitVector3::new_unchecked(na::Vector3::y()),
@@ -72,22 +108,28 @@ impl Renderer {
             na::Matrix4::identity()
         };
 
+        // Return the animation time, since that goes in the scene uniform buffer.
         time
     }
 
     pub fn render(&mut self) -> Result<()> {
+        // Cycle the animation.
         let time = self.animate();
 
-        // Create a command buffer.
+        // Create a command buffer to store our rendering commands.
         let mut command_buffer = vk::command_buffer::AutoCommandBufferBuilder::primary(
             &self.command_buffer_allocator,
             self.context.graphics_queue().queue_family_index(),
             vk::command_buffer::CommandBufferUsage::OneTimeSubmit,
         )?;
 
+        // Acquire a framebuffer we can render into.. This will (re-)create the framebuffers and
+        // swapchain if necessary. If all framebuffers are currently in use by the GPU, this will
+        // block until one becomes available.
         let framebuffer = self.framebuffers.borrow_mut().next(self)?;
 
         if self.sporadic_needs_update {
+            // Our sporadic uniforms have changed; write the new values to the uniform buffer.
             command_buffer.update_buffer(
                 Box::new(self.sporadic_uniforms),
                 self.sporadic_uniform_buffer.clone(),
@@ -96,6 +138,8 @@ impl Renderer {
             self.sporadic_needs_update = false;
         }
 
+        // Start the render pass by binding our framebuffer
+        // and clearing the color and depth attachments.
         command_buffer.begin_render_pass(
             vk::command_buffer::RenderPassBeginInfo {
                 clear_values: vec![
@@ -107,6 +151,7 @@ impl Renderer {
             vk::command_buffer::SubpassContents::Inline,
         )?;
 
+        // Configure our viewport dimensions.
         let dimensions = framebuffer.swapchain.image_extent();
         let dimensions = [dimensions[0] as f32, dimensions[1] as f32];
         command_buffer.set_viewport(
@@ -118,8 +163,10 @@ impl Renderer {
             }],
         );
 
+        // Use our graphics pipeline.
         command_buffer.bind_pipeline_graphics(self.pipeline.clone());
 
+        // If we do not already have a projection matrix, create one.
         let projection = self.projection.get_or_insert_with(|| {
             let mut projection = na::Matrix4::new_perspective(
                 dimensions[0] / dimensions[1],
@@ -131,7 +178,7 @@ impl Renderer {
             projection
         });
 
-        // Bind our descriptor sets, including uniforms
+        // Define our uniform buffers data.
         let scene_data = shaders::sample::ty::sceneBuf {
             uProjection: (*projection).into(),
             uView: self.view.into(),
@@ -149,11 +196,16 @@ impl Renderer {
             uShininess: 10.,
         };
 
+        // Upload our uniform buffers to the GPU, and create descriptor sets.
         let scene_descriptor_set = vk::descriptor_set::PersistentDescriptorSet::new(
             &self.descriptor_set_allocator,
             self.scene_uniform_buffer_layout.clone(),
             [vk::descriptor_set::WriteDescriptorSet::buffer(
                 0,
+                // Our uniform buffers are `CpuBufferPool`s, which is a helper type included in
+                // Vulkano that manages a pool of host-visible device-local buffers. It
+                // automatically handles double-buffering, so we can write to one buffer in the
+                // pool while the GPU is still rendering the previous frame using another buffer.
                 self.scene_uniform_buffer.from_data(scene_data)?,
             )],
         )?;
@@ -166,6 +218,7 @@ impl Renderer {
             )],
         )?;
 
+        // Bind our descriptor sets to the pipeline.
         command_buffer.bind_descriptor_sets(
             vk::pipeline::PipelineBindPoint::Graphics,
             self.pipeline.layout().clone(),
@@ -178,21 +231,25 @@ impl Renderer {
             ),
         );
 
+        // Draw our geometry.
         command_buffer.bind_vertex_buffers(0, [self.vertex_buffer.clone()]);
         command_buffer.draw(self.num_vertices, 1, 0, 0)?;
 
+        // we're done rendering!
         command_buffer.end_render_pass()?;
 
-        // Upload the command buffer to the GPU for processing after the previous frame completes.
+        // Now, we need to upload our command buffer to the GPU for processing.
+        // But we can't start processing this frame until the previous frame completes...
         let mut previous_frame = self
             .previous_frame
             .take()
             .unwrap_or_else(|| vk::sync::now(self.context.device().clone()).boxed());
         previous_frame.cleanup_finished();
 
-        // Don't start rendering until the framebuffer is available.
+        // ...and the next framebuffer is available.
         let ready = previous_frame.join(framebuffer.ready);
 
+        // Submit the command buffer for execution after the above conditions are met.
         let inflight = command_buffer
             .build()?
             .execute_after(ready, self.context.graphics_queue().clone())?
@@ -214,27 +271,32 @@ impl Renderer {
                 // Make sure we recreate it next time.
                 self.framebuffers.borrow_mut().invalidate();
             }
-            Err(e) => bail!(e),
+            Err(e) => bail!(e), // Something went wrong; return the error so we can print it.
         }
 
         Ok(())
     }
 
+    /// Called when the dimensions of the window change.
     pub fn resize(&mut self) {
+        // We'll need to recreate the swapchain and projection matrix before we can render again.
         self.framebuffers.get_mut().invalidate();
         self.projection = None;
     }
 
+    /// Called when the user toggles lighting off or on.
     pub fn toggle_lighting(&mut self) {
         self.sporadic_uniforms.uUseLighting = (self.sporadic_uniforms.uUseLighting == 0) as i32;
         self.sporadic_needs_update = true;
     }
 
+    /// Called when the user toggles texturing off or on.
     pub fn toggle_mode(&mut self) {
         self.sporadic_uniforms.uMode = (self.sporadic_uniforms.uMode == 0) as i32;
         self.sporadic_needs_update = true;
     }
 
+    /// Called when the user presses the "pause" key.
     pub fn toggle_paused(&mut self) {
         self.animation_state = match self.animation_state {
             AnimationState::Running { start } => AnimationState::Paused {
@@ -246,10 +308,12 @@ impl Renderer {
         }
     }
 
+    /// Called when the user toggles rotation off or on.
     pub fn toggle_rotation(&mut self) {
         self.use_rotation = !self.use_rotation;
     }
 
+    /// Creates our geometry.
     fn vertices() -> Vec<shaders::sample::Attributes> {
         use shaders::sample::Attributes;
         vec![
@@ -369,6 +433,7 @@ impl Renderer {
         ]
     }
 
+    /// Initializes all rendering resources.
     pub fn new(context: VulkanoContext, surface: Arc<vk::swapchain::Surface>) -> Result<Self> {
         // Choose a color and depth format.
         let color_format = context
@@ -388,6 +453,7 @@ impl Renderer {
             .0;
         let depth_format = vk::format::Format::D16_UNORM;
 
+        // Define our render pass.
         let render_pass = vulkano::single_pass_renderpass!(context.device().clone(),
             attachments: {
                 // Clear the color buffer on load, and store it to memory so we can see it.
@@ -398,6 +464,10 @@ impl Renderer {
                     samples: 1,
                 },
                 // Clear the depth buffer on load, but we don't need to save the results.
+                // This is a significant performance optimization on GPUs that support tiled
+                // rendering (i.e. completely rendering a small tile of the screen before moving
+                // onto the next tile), because it means the depth buffer can be stored in registers
+                // on the GPU and never actually written to off-chip memory.
                 depth: {
                     load: Clear,
                     store: DontCare,
@@ -411,34 +481,42 @@ impl Renderer {
             }
         )?;
 
+        // Define our graphics pipeline:
         let pipeline = vk::pipeline::GraphicsPipeline::start()
+            // Use the render pass we described above
             .render_pass(
                 vk::pipeline::graphics::render_pass::PipelineRenderPassType::BeginRenderPass(
                     render_pass.clone().first_subpass(),
                 ),
             )
+            // The vertex inputs are defined as in our shader attributes.
             .vertex_input_state(
                 vk::pipeline::graphics::vertex_input::BuffersDefinition::new()
                     .vertex::<shaders::sample::Attributes>(),
             )
+            // Pass the inputs through our vertex shader
             .vertex_shader(
                 shaders::sample::load_vertex(context.device().clone())?
                     .entry_point("main")
                     .context("entry point not found")?,
                 (),
             )
+            // Pass the pixels through our fragment shader
             .fragment_shader(
                 shaders::sample::load_fragment(context.device().clone())?
                     .entry_point("main")
                     .context("entry point not found")?,
                 (),
             )
+            // Use a basic depth test, and no stencil buffer.
             .depth_stencil_state(vk::pipeline::graphics::depth_stencil::DepthStencilState::simple_depth_test())
+            // We'll define the viewport when we render, and we won't use a scissr test.
             .viewport_state(
                 vk::pipeline::graphics::viewport::ViewportState::viewport_dynamic_scissor_irrelevant(),
             )
             .build(context.device().clone())?;
 
+        // Now let's set up our descriptor sets.
         let descriptor_set_allocator =
             vk::descriptor_set::allocator::StandardDescriptorSetAllocator::new(
                 context.device().clone(),
@@ -539,12 +617,7 @@ impl Renderer {
         let object_uniform_buffer =
             vk::buffer::CpuBufferPool::uniform_buffer(context.memory_allocator().clone());
 
-        let descriptor_set_allocator =
-            vk::descriptor_set::allocator::StandardDescriptorSetAllocator::new(
-                context.device().clone(),
-            );
-
-        // Create a command buffer so we can upload data to our vertex buffers.
+        // Create a command buffer so we can upload our vertex buffer & texture.
         let command_buffer_allocator =
             vk::command_buffer::allocator::StandardCommandBufferAllocator::new(
                 context.device().clone(),
@@ -571,9 +644,11 @@ impl Renderer {
 
         // Load the texture.
 
+        // Load the image from disk.
         let texture_image = image::open("mikebailey.jpg")?.into_rgba8();
         let (width, height) = texture_image.dimensions();
 
+        // Create an image buffer in GPU memory, and upload it to the GPU.
         let texture_image = Arc::new(vk::image::ImmutableImage::from_iter(
             context.memory_allocator(),
             texture_image.into_raw(),
@@ -592,6 +667,7 @@ impl Renderer {
             vk::image::view::ImageViewCreateInfo::from_image(&texture_image),
         )?;
 
+        // Create a sampler that describes how to access our image.
         let sampler = vk::sampler::Sampler::new(
             context.device().clone(),
             vk::sampler::SamplerCreateInfo {
@@ -601,6 +677,7 @@ impl Renderer {
             },
         )?;
 
+        // Create a descriptor set binding our texture & sampler to the graphics pipeline.
         let sampler_descriptor_set = vk::descriptor_set::PersistentDescriptorSet::new(
             &descriptor_set_allocator,
             vk::descriptor_set::layout::DescriptorSetLayout::new(
@@ -623,6 +700,7 @@ impl Renderer {
             ],
         )?;
 
+        // Submit our upload commands to the GPU.
         let previous_frame = command_buffer
             .build()?
             .execute(context.graphics_queue().clone())?
@@ -635,42 +713,41 @@ impl Renderer {
 
             color_format,
             depth_format,
-            render_pass,
-
             framebuffers: Default::default(),
+
+            render_pass,
             pipeline,
             command_buffer_allocator,
 
             descriptor_set_allocator,
-            sporadic_uniform_buffer,
-            scene_uniform_buffer_layout,
-            object_uniform_buffer_layout,
-            sporadic_descriptor_set,
-            sporadic_needs_update: true,
-            scene_uniform_buffer,
-            object_uniform_buffer,
-            vertex_buffer,
-            num_vertices: num_vertices.try_into().expect("that's a lot of vertices"),
-
-            projection: None,
             sporadic_uniforms: shaders::sample::ty::sporadicBuf {
                 uMode: 0,
                 uUseLighting: 0,
                 uNumInstances: 1,
             },
+            sporadic_needs_update: true,
+            sporadic_uniform_buffer,
+            sporadic_descriptor_set,
+            scene_uniform_buffer,
+            object_uniform_buffer_layout,
+            scene_uniform_buffer_layout,
+            object_uniform_buffer,
+            sampler_descriptor_set,
+            projection: None,
+
             view: na::Matrix4::look_at_rh(
                 &na::Point3::new(-2., 1., -2.),
                 &na::Point3::origin(),
                 &na::Vector3::y(),
             ),
             scene_orient: na::Matrix4::identity(),
-
             animation_state: AnimationState::Running {
                 start: std::time::Instant::now(),
             },
             use_rotation: true,
 
-            sampler_descriptor_set,
+            vertex_buffer,
+            num_vertices: num_vertices.try_into().expect("that's a lot of vertices"),
 
             previous_frame: Some(previous_frame),
         })
@@ -726,19 +803,23 @@ impl Framebuffers {
     }
 
     /// Acquires the next framebuffer in the swapchain.
+    /// Recreates the swapchain if necessary. If all framebuffers are currently in use by the GPU,
+    /// blocks until one becomes available.
     fn next(&mut self, renderer: &Renderer) -> Result<Framebuffer> {
         loop {
+            // Do we have a valid swapchain already?
             let (swapchain, framebuffers) = match self {
                 Self::Valid {
                     swapchain,
                     framebuffers,
-                } => (swapchain.clone(), &*framebuffers),
+                } => (swapchain.clone(), &*framebuffers), // Yes, use it.
                 Self::Invalid { .. } => {
-                    self.create(renderer)?;
+                    self.create(renderer)?; // No, create one.
                     continue;
                 }
             };
 
+            // Get the next framebuffer from the swapchain.
             match vk::swapchain::acquire_next_image(swapchain.clone(), None) {
                 Ok((index, suboptimal, ready)) => {
                     let index = index as usize;
@@ -757,6 +838,8 @@ impl Framebuffers {
                     });
                 }
                 Err(vk::swapchain::AcquireError::OutOfDate) => {
+                    // We could not acquire a framebuffer because the surface has changed such that
+                    // our swapchain is invalid. Recreate the swapchain and try again.
                     self.invalidate();
                     continue;
                 }
@@ -765,7 +848,9 @@ impl Framebuffers {
         }
     }
 
+    /// Creates or recreates the framebuffers and swapchain.
     pub fn create(&mut self, renderer: &Renderer) -> Result<()> {
+        // If we have an old swapchain, we can reuse its resources.
         let old_swapchain = match std::mem::take(self) {
             Self::Valid { swapchain, .. } => Some(swapchain),
             Self::Invalid { old_swapchain } => old_swapchain,
@@ -791,6 +876,7 @@ impl Framebuffers {
             ..Default::default()
         };
 
+        // Create a swapchain & color buffers for our surface.
         let (swapchain, color_buffers) = if let Some(old) = old_swapchain {
             old.recreate(swapchain_info)?
         } else {
@@ -802,7 +888,7 @@ impl Framebuffers {
         };
 
         // The depth buffer can be transient
-        // (i.e. not necessarily kept in memory between render passes.)
+        // (i.e. it doesn't need to be kept in memory between render passes.)
         let depth_buffer =
             vk::image::view::ImageView::new_default(vk::image::AttachmentImage::transient(
                 renderer.context.memory_allocator(),
