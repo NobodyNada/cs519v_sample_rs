@@ -51,7 +51,7 @@ main( )
 	switch( Sporadic.uMode )
 	{
 		case 0:
-			rgb = vColor;
+			rgb = Object.uColor.xyz;
 			break;
 
 		case 1:

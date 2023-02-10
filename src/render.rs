@@ -40,6 +40,9 @@ pub struct Renderer {
     /// The descriptor set binding our sporadic uniforms to the pipeline.
     sporadic_descriptor_set: Arc<vk::descriptor_set::PersistentDescriptorSet>,
 
+    /// The object uniforms for our object.
+    object_uniforms: shaders::sample::ty::objectBuf,
+
     /// The uniform buffer for our scene uniforms, stored in device memory and updated each frame.
     scene_uniform_buffer: vk::buffer::CpuBufferPool<shaders::sample::ty::sceneBuf>,
     /// The uniform buffer for our object uniforms in device memory.
@@ -82,6 +85,8 @@ pub struct Renderer {
     /// may be indefinitely in the future. Later on, we can synchronize events (such as the
     /// rendering of the next frame) to occur after this future completes.
     previous_frame: Option<Box<dyn vk::sync::GpuFuture>>,
+
+    previous_frame_fence: Option<Arc<vk::sync::Fence>>,
 }
 
 /// The status of our animation.
@@ -212,13 +217,6 @@ impl Renderer {
             uTime: time,
         };
 
-        let object_data = shaders::sample::ty::objectBuf {
-            uModel: na::Matrix4::identity().into(),
-            uNormal: na::Matrix4::identity().into(),
-            uColor: [1., 0., 0., 1.],
-            uShininess: 10.,
-        };
-
         // Upload our uniform buffers to the GPU, and create descriptor sets.
         let scene_descriptor_set = vk::descriptor_set::PersistentDescriptorSet::new(
             &self.descriptor_set_allocator,
@@ -237,7 +235,7 @@ impl Renderer {
             self.object_uniform_buffer_layout.clone(),
             [vk::descriptor_set::WriteDescriptorSet::buffer(
                 0,
-                self.object_uniform_buffer.from_data(object_data)?,
+                self.object_uniform_buffer.from_data(self.object_uniforms)?,
             )],
         )?;
 
@@ -263,17 +261,16 @@ impl Renderer {
 
         // Now, we need to upload our command buffer to the GPU for processing.
         // But we can't start processing this frame until the previous frame completes...
-        let mut previous_frame = self
+        let previous_frame = self
             .previous_frame
             .take()
             .unwrap_or_else(|| vk::sync::now(self.context.device().clone()).boxed());
-        previous_frame.cleanup_finished();
 
         // ...and the next framebuffer is available.
         let ready = previous_frame.join(framebuffer.ready);
 
         // Submit the command buffer for execution after the above conditions are met.
-        let inflight = command_buffer
+        let mut inflight = command_buffer
             .build()?
             .execute_after(ready, self.context.graphics_queue().clone())?
             .then_swapchain_present(
@@ -287,6 +284,7 @@ impl Renderer {
         match inflight.flush() {
             Ok(_) => {
                 // Our frame is being processed!
+                inflight.cleanup_finished();
                 self.previous_frame = Some(inflight.boxed())
             }
             Err(vk::sync::FlushError::OutOfDate) => {
@@ -296,6 +294,21 @@ impl Renderer {
             }
             Err(e) => bail!(e), // Something went wrong; return the error so we can print it.
         }
+
+        // Signal a fence after the frame is finished.
+        let fence = Arc::new(vk::sync::Fence::from_pool(self.context.device().clone())?);
+        unsafe {
+            // This seems to be the only way to do this at the moment...
+            self.context
+                .graphics_queue()
+                .with(|mut q| q.submit_unchecked([Default::default()], Some(fence.clone())))?;
+        }
+
+        // Wait for the previous frame to finish rendering, so we don't get a ton of them piled up.
+        if let Some(fence) = self.previous_frame_fence.take() {
+            fence.wait(None)?;
+        }
+        self.previous_frame_fence = Some(fence);
 
         Ok(())
     }
@@ -312,7 +325,7 @@ impl Renderer {
         self.mouse_rotation += vector![-dy, dx] * ANGFACT;
     }
 
-    pub fn mouse_scrolled(&mut self, dx: f32, dy: f32) {
+    pub fn mouse_scrolled(&mut self, _dx: f32, dy: f32) {
         const SCLFACT: f32 = 0.005;
         const MINSCALE: f32 = 0.05;
         self.mouse_scale += dy * SCLFACT;
@@ -332,6 +345,8 @@ impl Renderer {
     }
 
     /// Called when the user presses the "pause" key.
+    #[allow(clippy::unchecked_duration_subtraction)] // overly pedantic lint that will
+                                                     // be disabled by default in Rust 1.68
     pub fn toggle_paused(&mut self) {
         self.animation_state = match self.animation_state {
             AnimationState::Running { start } => AnimationState::Paused {
@@ -615,6 +630,13 @@ impl Renderer {
             },
         )?;
 
+        let object_uniforms = shaders::sample::ty::objectBuf {
+            uModel: na::Matrix4::identity().into(),
+            uNormal: na::Matrix4::identity().into(),
+            uColor: [1., 0., 0., 1.],
+            uShininess: 10.,
+        };
+
         // Allocate the sporadic uniform buffer.
         // Since we rarely need to write to it, we can make it device-local
         // and issue upload commands when we need to access it.
@@ -757,10 +779,12 @@ impl Renderer {
             descriptor_set_allocator,
             sporadic_uniforms: shaders::sample::ty::sporadicBuf {
                 uMode: 0,
-                uUseLighting: 0,
+                uUseLighting: 1,
                 uNumInstances: 1,
             },
             sporadic_needs_update: true,
+            object_uniforms,
+
             sporadic_uniform_buffer,
             sporadic_descriptor_set,
             scene_uniform_buffer,
@@ -787,6 +811,7 @@ impl Renderer {
             num_vertices: num_vertices.try_into().expect("that's a lot of vertices"),
 
             previous_frame: Some(previous_frame),
+            previous_frame_fence: None,
         })
     }
 }

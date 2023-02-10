@@ -114,7 +114,7 @@ fn main() -> Result<()> {
             // Once we've processed all the events for this frame, render the frame.
             Event::MainEventsCleared => match renderer.render() {
                 Ok(()) => {}
-                Err(e) => eprintln!("[ERROR] {e}"),
+                Err(e) => eprintln!("[ERROR] {e:?}"),
             },
 
             // Ignore other types of events.
